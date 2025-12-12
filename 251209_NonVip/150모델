@@ -1,0 +1,358 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+from scipy.stats import linregress
+
+# sklearn 있으면 사용, 없으면 수동 min-max
+try:
+    from sklearn.preprocessing import MinMaxScaler
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+print("📂 CSV 자동 탐색(컬럼 기반) 시작...")
+
+# =========================
+# 1) 폴더 CSV 목록
+# =========================
+csv_files = sorted(glob.glob("*.csv"))
+if len(csv_files) == 0:
+    raise FileNotFoundError("❌ 현재 폴더에 CSV 파일이 없음")
+
+print(f"✅ 발견된 CSV: {len(csv_files)}개")
+
+# =========================
+# 2) CSV 헤더(컬럼)만 안전하게 읽는 함수
+# =========================
+def read_columns_only(path):
+    encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr"]
+    last_err = None
+    for enc in encodings:
+        try:
+            tmp = pd.read_csv(path, nrows=0, encoding=enc, low_memory=False)
+            return list(tmp.columns), enc
+        except Exception as e:
+            last_err = e
+            continue
+    return None, None
+
+# =========================
+# 3) 컬럼 자동 찾기(키워드 매칭)
+# =========================
+def find_col(cols, exact_first=None, must_have=None, any_have=None):
+    cols_list = list(cols)
+
+    if exact_first is None:
+        exact_first = []
+    if must_have is None:
+        must_have = []
+    if any_have is None:
+        any_have = []
+
+    for ex in exact_first:
+        if ex in cols_list:
+            return ex
+
+    if len(must_have) > 0:
+        for c in cols_list:
+            ok = True
+            for kw in must_have:
+                if kw not in c:
+                    ok = False
+                    break
+            if ok:
+                return c
+
+    if len(any_have) > 0:
+        for c in cols_list:
+            for kw in any_have:
+                if kw in c:
+                    return c
+
+    return None
+
+# =========================
+# 4) 변수 리스트 파일 자동 선택
+#    (변수명 컬럼 있거나, 150개 내외면 우선)
+# =========================
+feature_candidates = []
+for f in csv_files:
+    cols, enc = read_columns_only(f)
+    if cols is None:
+        continue
+
+    score = 0
+    name_l = f.lower()
+
+    if "final_selected_150" in name_l:
+        score += 50
+    if "150" in name_l:
+        score += 10
+    if ("feature" in name_l) or ("변수" in f):
+        score += 5
+    if "변수명" in cols:
+        score += 30
+
+    # shap importance 같은 애들은 감점(변수 리스트로 쓰기 애매)
+    if "shap_values" in name_l or "feature_importance" in name_l:
+        score -= 20
+
+    feature_candidates.append((score, f, enc, cols))
+
+feature_candidates = sorted(feature_candidates, key=lambda x: x[0], reverse=True)
+if len(feature_candidates) == 0 or feature_candidates[0][0] <= 0:
+    raise FileNotFoundError("❌ 변수 리스트로 쓸만한 CSV를 자동으로 못 찾음")
+
+feature_file = feature_candidates[0][1]
+print(f"✅ 변수 리스트 파일 자동 선택: {feature_file}")
+
+# 변수 리스트 로드
+try:
+    features_df = pd.read_csv(feature_file, encoding="utf-8-sig")
+except Exception:
+    try:
+        features_df = pd.read_csv(feature_file, encoding="cp949")
+    except Exception:
+        features_df = pd.read_csv(feature_file)
+
+if "변수명" in features_df.columns:
+    selected_features = features_df["변수명"].dropna().astype(str).tolist()
+else:
+    selected_features = features_df.iloc[:, 0].dropna().astype(str).tolist()
+
+print(f"✅ 변수 리스트 개수: {len(selected_features)}개")
+
+# =========================
+# 5) VIP 원본(데이터) 파일 자동 선택
+#    -> 파일명이 아니라 "필수 컬럼이 있는지"로 점수 매김
+# =========================
+data_candidates = []
+
+for f in csv_files:
+    if f == feature_file:
+        continue
+
+    cols, enc = read_columns_only(f)
+    if cols is None:
+        continue
+
+    name_l = f.lower()
+
+    id_col = find_col(cols, exact_first=["발급회원번호"], must_have=["회원", "번호"], any_have=["회원번호", "고객번호"])
+    month_col = find_col(cols, exact_first=["기준년월"], any_have=["년월", "기준월", "기준_년월"])
+    spend_col = find_col(cols, exact_first=["이용금액_신용_B0M"], must_have=["이용금액"], any_have=["이용금액"])
+    count_col = find_col(cols, exact_first=["이용건수_신용_B0M"], must_have=["이용건수"], any_have=["이용건수", "승인건수"])
+    bal_col = find_col(cols, exact_first=["잔액_B0M"], must_have=["잔액"], any_have=["잔액"])
+
+    score = 0
+    if id_col is not None: score += 30
+    if month_col is not None: score += 30
+    if spend_col is not None: score += 15
+    if count_col is not None: score += 15
+    if bal_col is not None: score += 10
+
+    # 컬럼 많을수록(원본일 확률) 가산
+    if len(cols) >= 200: score += 10
+    if len(cols) >= 500: score += 10
+
+    # 파일명 힌트 가산/감점
+    if "데이터" in f or "final" in name_l: score += 5
+    if "shap_values" in name_l or "feature_importance" in name_l: score -= 30
+    if "선택변수리스트" in f: score -= 40
+
+    data_candidates.append((score, f, enc, id_col, month_col, spend_col, count_col, bal_col))
+
+data_candidates = sorted(data_candidates, key=lambda x: x[0], reverse=True)
+
+print("\n🔎 데이터 파일 후보 TOP5(점수, 파일명)")
+for item in data_candidates[:5]:
+    print(f" - {item[0]:>3}점 | {item[1]}")
+
+if len(data_candidates) == 0 or data_candidates[0][0] < 60:
+    raise FileNotFoundError("❌ '발급회원번호/기준년월/이용금액/이용건수/잔액' 구성된 데이터 파일을 자동으로 못 찾음")
+
+vip_file = data_candidates[0][1]
+ENC_DATA = data_candidates[0][2]
+
+ID_COL = data_candidates[0][3]
+MONTH_COL = data_candidates[0][4]
+SPEND_COL = data_candidates[0][5]
+COUNT_COL = data_candidates[0][6]
+BAL_COL = data_candidates[0][7]
+
+print(f"\n✅ 데이터 파일 자동 선택: {vip_file}")
+print("🧩 자동 인식 컬럼")
+print(f" - ID      : {ID_COL}")
+print(f" - YEARMO  : {MONTH_COL}")
+print(f" - SPEND   : {SPEND_COL}")
+print(f" - COUNT   : {COUNT_COL}")
+print(f" - BALANCE : {BAL_COL}")
+
+# =========================
+# 6) 데이터 로드
+# =========================
+print("\n📥 데이터 로드 중...")
+try:
+    df = pd.read_csv(vip_file, encoding=ENC_DATA, low_memory=False)
+except Exception:
+    df = pd.read_csv(vip_file, low_memory=False)
+
+print(f"✅ 원본 데이터 크기: {df.shape}")
+
+# 리스크 컬럼은 있으면 쓰고, 없으면 0 처리
+RISK_BAL_COL = "연체잔액_B0M" if "연체잔액_B0M" in df.columns else None
+RISK_DECLINE_COL = "승인거절건수_B0M" if "승인거절건수_B0M" in df.columns else None
+
+# 타입 정리
+df[MONTH_COL] = df[MONTH_COL].astype(str).str.replace(".0", "", regex=False)
+df[MONTH_COL] = pd.to_numeric(df[MONTH_COL], errors="coerce")
+df = df.dropna(subset=[ID_COL, MONTH_COL])
+df[MONTH_COL] = df[MONTH_COL].astype(int)
+
+for c in [SPEND_COL, COUNT_COL, BAL_COL]:
+    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+if RISK_BAL_COL is None:
+    df["__RISK_BAL_TMP__"] = 0
+    RISK_BAL_COL = "__RISK_BAL_TMP__"
+else:
+    df[RISK_BAL_COL] = pd.to_numeric(df[RISK_BAL_COL], errors="coerce").fillna(0)
+
+if RISK_DECLINE_COL is None:
+    df["__RISK_DEC_TMP__"] = 0
+    RISK_DECLINE_COL = "__RISK_DEC_TMP__"
+else:
+    df[RISK_DECLINE_COL] = pd.to_numeric(df[RISK_DECLINE_COL], errors="coerce").fillna(0)
+
+# =========================
+# 7) Churn_Score 계산 (최근 6개월 slope)
+# =========================
+print("\n⚡ Churn_Score 계산 시작...")
+
+LOOKBACK_N = 6
+W_SPEND, W_BALANCE, W_COUNT, W_RISK = 40, 30, 20, 10
+
+df = df.sort_values([ID_COL, MONTH_COL])
+target_month = int(df[MONTH_COL].max())
+df_final = df[df[MONTH_COL] == target_month].copy()
+
+print(f"   - 분석 기준월: {target_month} (고객 수: {len(df_final)}명)")
+
+def calc_slope_last_n(group_df, value_col, n):
+    s = group_df[value_col].tail(n).fillna(0)
+    if len(s) < 2:
+        return 0.0
+    if float(s.sum()) == 0.0:
+        return 0.0
+    y = s.values.astype(float)
+    if np.all(y == y[0]):
+        return 0.0
+    x = np.arange(len(y))
+    slope, _, _, _, _ = linregress(x, y)
+    if np.isnan(slope):
+        return 0.0
+    return float(slope)
+
+print("   - 고객별 최근 6개월 기울기 계산 중...")
+slope_spend = df.groupby(ID_COL, sort=False).apply(lambda g: calc_slope_last_n(g, SPEND_COL, LOOKBACK_N))
+slope_count = df.groupby(ID_COL, sort=False).apply(lambda g: calc_slope_last_n(g, COUNT_COL, LOOKBACK_N))
+slope_bal   = df.groupby(ID_COL, sort=False).apply(lambda g: calc_slope_last_n(g, BAL_COL, LOOKBACK_N))
+
+df_final["Slope_Spend"] = df_final[ID_COL].map(slope_spend).fillna(0)
+df_final["Slope_Count"] = df_final[ID_COL].map(slope_count).fillna(0)
+df_final["Slope_Balance"] = df_final[ID_COL].map(slope_bal).fillna(0)
+
+def slope_to_score(slope_series):
+    neg = slope_series.apply(lambda x: -x if x < 0 else 0).astype(float).values
+    if np.max(neg) == np.min(neg):
+        return np.zeros(len(neg))
+    if SKLEARN_OK:
+        scaler = MinMaxScaler()
+        return scaler.fit_transform(neg.reshape(-1, 1)).flatten()
+    return (neg - np.min(neg)) / (np.max(neg) - np.min(neg))
+
+score_spend = slope_to_score(df_final["Slope_Spend"])
+score_count = slope_to_score(df_final["Slope_Count"])
+score_balance = slope_to_score(df_final["Slope_Balance"])
+
+has_risk = np.where(
+    (df_final[RISK_BAL_COL] > 0) | (df_final[RISK_DECLINE_COL] > 0),
+    1,
+    0
+)
+
+df_final["Churn_Score"] = (
+    (score_spend * W_SPEND) +
+    (score_balance * W_BALANCE) +
+    (score_count * W_COUNT) +
+    (has_risk * W_RISK)
+).round(1)
+
+print(f"✅ Churn_Score 생성 완료! (평균: {df_final['Churn_Score'].mean():.1f}점)")
+
+# =========================
+# 8) 150개 변수 + 점수 저장
+# =========================
+print("\n✂️ 150개 변수 + Churn_Score 추출/저장 중...")
+
+selected_in_data = [c for c in selected_features if c in df_final.columns]
+missing = [c for c in selected_features if c not in df_final.columns]
+
+print(f"   - 실제 포함된 변수: {len(selected_in_data)}개")
+print(f"   - 누락 변수: {len(missing)}개")
+
+final_cols = [ID_COL] + selected_in_data + ["Churn_Score"]
+df_export = df_final[final_cols].copy()
+
+OUTPUT_FILE = "VIP_Target_150_Selected.csv"
+df_export.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+
+print("\n🎉 완료!")
+print(f"📂 저장 파일: {OUTPUT_FILE}")
+print(f"📊 최종 크기: {df_export.shape}")
+
+
+
+
+📂 CSV 자동 탐색(컬럼 기반) 시작...
+✅ 발견된 CSV: 13개
+✅ 변수 리스트 파일 자동 선택: Final_Selected_150_Features_SHAP_Priority.csv
+✅ 변수 리스트 개수: 150개
+
+🔎 데이터 파일 후보 TOP5(점수, 파일명)
+ - 125점 | 일반인데이터.csv
+ - 115점 | 일반인데이터_SHAP0제거_full.csv
+ - 105점 | 일반인데이터_SHAPVIF_TOP150_데이터.csv
+ -  90점 | shap_values_by_sample.csv
+ -  85점 | 일반인데이터_SHAP0제거_X_test.csv
+
+✅ 데이터 파일 자동 선택: 일반인데이터.csv
+🧩 자동 인식 컬럼
+ - ID      : 발급회원번호
+ - YEARMO  : 기준년월
+ - SPEND   : 이용금액_신용_B0M
+ - COUNT   : 이용건수_신용_B0M
+ - BALANCE : 잔액_B0M
+
+📥 데이터 로드 중...
+✅ 원본 데이터 크기: (48540, 898)
+
+⚡ Churn_Score 계산 시작...
+   - 분석 기준월: 201812 (고객 수: 8090명)
+   - 고객별 최근 6개월 기울기 계산 중...
+C:\Users\82104\AppData\Local\Temp\ipykernel_9236\822094121.py:258: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  slope_spend = df.groupby(ID_COL, sort=False).apply(lambda g: calc_slope_last_n(g, SPEND_COL, LOOKBACK_N))
+C:\Users\82104\AppData\Local\Temp\ipykernel_9236\822094121.py:259: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  slope_count = df.groupby(ID_COL, sort=False).apply(lambda g: calc_slope_last_n(g, COUNT_COL, LOOKBACK_N))
+C:\Users\82104\AppData\Local\Temp\ipykernel_9236\822094121.py:260: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  slope_bal   = df.groupby(ID_COL, sort=False).apply(lambda g: calc_slope_last_n(g, BAL_COL, LOOKBACK_N))
+✅ Churn_Score 생성 완료! (평균: 3.9점)
+
+✂️ 150개 변수 + Churn_Score 추출/저장 중...
+   - 실제 포함된 변수: 150개
+   - 누락 변수: 0개
+
+🎉 완료!
+📂 저장 파일: VIP_Target_150_Selected.csv
+📊 최종 크기: (8090, 152)
